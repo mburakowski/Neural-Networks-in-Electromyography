@@ -2,6 +2,9 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+from sklearn.model_selection import StratifiedKFold
+from copy import deepcopy
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from scipy.io import loadmat
 from scipy.signal import stft
@@ -9,6 +12,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report
 
 def load_data(folder_path):
     X, y = [], []
@@ -53,7 +57,7 @@ class EMGDataset(Dataset):
     def __init__(self, X_raw, y_raw, label_encoder, max_val=None, augment=False):
         self.augment = augment
         self.X_raw = X_raw
-        self.y = label_encoder.transform(y_raw)
+        self.y = y_raw
         self.label_encoder = label_encoder
         self.max_val = max_val or np.max([signal_to_spectrogram(x).max() for x in X_raw])
 
@@ -70,8 +74,6 @@ class EMGDataset(Dataset):
         c, f, t = spec.shape
         spec = spec.transpose(2, 0, 1).reshape(t, c * f)
         return torch.tensor(spec, dtype=torch.float32), torch.tensor(self.y[idx], dtype=torch.long)
-
-
 
 class EMGTransformer(nn.Module):
     def __init__(self, input_dim, num_classes):
@@ -132,7 +134,7 @@ def train_model(model, train_loader, val_loader, epochs=30, lr=1e-3):
         avg_train_loss = total_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
         val_acc = correct / total
-        print(f"Epoka {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}, Val Acc={val_acc:.2f}")
+        print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}, Val Acc={val_acc:.2f}")
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['val_acc'].append(val_acc)
@@ -165,41 +167,108 @@ def evaluate_model(model, loader, label_encoder=None):
 
     return all_preds, all_targets
 
+def train_one_fold(model, train_loader, val_loader, device, epochs=50, patience=5, lr=1e-3):
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    best_model = deepcopy(model.state_dict())
+    best_val_loss = float('inf')
+    wait = 0
+    history = []
+
+    for epoch in range(1, epochs+1):
+        model.train()
+        total_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            out = model(X_batch)
+            loss = criterion(out, y_batch)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        # Walidacja
+        model.eval()
+        val_loss = 0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                out = model(X_batch)
+                val_loss += criterion(out, y_batch).item()
+                preds = out.argmax(1)
+                correct += (preds == y_batch).sum().item()
+                total += y_batch.size(0)
+
+        avg_train_loss = total_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+        val_acc = correct / total
+        print(f"Epoka {epoch}: Train Loss={avg_train_loss:.4f}, Val Loss={avg_val_loss:.4f}, Val Acc={val_acc:.2f}")
+
+        history.append((avg_train_loss, avg_val_loss, val_acc))
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model = deepcopy(model.state_dict())
+            wait = 0
+        else:
+            wait += 1
+            if wait >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    model.load_state_dict(best_model)
+    return model, history
+
+
 def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Używane urządzenie:", device)
+
     train_path = 'pomiary_chwyty/trening'
     test_path = 'pomiary_chwyty/test'
 
     X_train_raw, y_train_raw = load_data(train_path)
     X_test_raw, y_test_raw = load_data(test_path)
 
-    print(f"Załadowano {len(X_train_raw)} próbek treningowych, {len(X_test_raw)} testowych.")
-
     le = LabelEncoder()
     le.fit(np.concatenate((y_train_raw, y_test_raw)))
     num_classes = len(le.classes_)
 
-    full_train_set = EMGDataset(X_train_raw, y_train_raw, le, augment=True)
-    test_set = EMGDataset(X_test_raw, y_test_raw, le, max_val=full_train_set.max_val, augment=False)
+    X = np.array(X_train_raw)
+    y = np.array(le.transform(y_train_raw))
 
-    val_size = int(0.2 * len(full_train_set))
-    train_size = len(full_train_set) - val_size
-    train_set, val_set = random_split(full_train_set, [train_size, val_size])
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_models = []
 
-    train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=16)
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        print(f"\n===== Fold {fold} =====")
+
+        train_set = EMGDataset(X[train_idx], y[train_idx], le, augment=True)
+        val_set = EMGDataset(X[val_idx], y[val_idx], le, max_val=train_set.max_val)
+
+        train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
+        val_loader = DataLoader(val_set, batch_size=16)
+
+        input_dim = train_set[0][0].shape[1]
+        model = EMGTransformer(input_dim=input_dim, num_classes=num_classes)
+
+        model, _ = train_one_fold(model, train_loader, val_loader, device)
+        fold_models.append(deepcopy(model))
+
+    print("\n=== Ewaluacja na zbiorze testowym ===")
+    y_test_encoded = le.transform(y_test_raw)
+    test_set = EMGDataset(X_test_raw, y_test_encoded, le, max_val=train_set.max_val)
     test_loader = DataLoader(test_set, batch_size=16)
-
-    input_dim = full_train_set[0][0].shape[1]
-    model = EMGTransformer(input_dim=input_dim, num_classes=num_classes)
-
-    history = train_model(model, train_loader, val_loader)
-
+    model = fold_models[-1]
     preds, targets = evaluate_model(model, test_loader, label_encoder=le)
-    
-    from sklearn.metrics import classification_report
 
     print("\n=== Classification Report ===")
     print(classification_report(targets, preds, target_names=le.classes_))
+
 
 if __name__ == "__main__":
     main()
